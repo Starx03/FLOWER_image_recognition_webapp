@@ -1,73 +1,98 @@
-import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
-import json
-import urllib.request
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, models, transforms
 
-st.set_page_config(page_title="Flower Species Classifier", page_icon="🌸")
-st.title("🌸 Flower Species Classifier")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Load official Flowers-102 class mapping (JSON maps "1".."102" to species names)
-@st.cache_data
-def load_class_names():
-    url = "https://raw.githubusercontent.com/Anish9901/Flowers-102-PyTorch/master/cat_to_name.json"
-    req = urllib.request.urlopen(url)
-    return json.loads(req.read().decode('utf-8'))
+data_transforms = {
+    "train": transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]),
+    "val": transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]),
+}
 
-cat_to_name = load_class_names()
+# Use 'test' set (6149 images) for training and 'train' set (1020 images) for validation
+train_dataset = datasets.Flowers102(
+    root="./data", split="test", download=True, transform=data_transforms["train"]
+)
+val_dataset = datasets.Flowers102(
+    root="./data", split="train", download=True, transform=data_transforms["val"]
+)
 
-transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-@st.cache_resource
-def load_model():
-    model = models.resnet50(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, 102)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.load_state_dict(torch.load('flower_resnet50.pth', map_location=device))
-    model.eval()
-    return model, device
+num_classes = 102
 
-try:
-    model, device = load_model()
-except Exception as e:
-    st.error("Could not load 'flower_resnet50.pth'. Ensure train_cv_model.py finished running.")
-    st.stop()
+model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 
-uploaded_file = st.file_uploader("Choose a flower image...", type=["jpg", "jpeg", "png"])
+# Freeze backbone
+for param in model.parameters():
+  param.requires_grad = False
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_container_width=True)
-    
-    input_tensor = transform(image).unsqueeze(0).to(device)
-    
-    with st.spinner("Analyzing image features..."):
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-            top3_prob, top3_catid = torch.topk(probabilities, 3)
+model.fc = nn.Linear(model.fc.in_features, num_classes)
+model = model.to(device)
 
-    st.subheader("Prediction Results")
-    
-    # Map index back to 1-based JSON key
-    top1_idx = str(top3_catid[0].item() + 1)
-    top1_name = cat_to_name.get(top1_idx, "Unknown Flower").title()
-    top1_score = top3_prob[0].item() * 100
-    
-    st.success(f"**Top Prediction:** {top1_name} ({top1_score:.1f}% confidence)")
-    
-    st.write("---")
-    st.write("**Top 3 Likely Species:**")
-    for i in range(3):
-        idx = str(top3_catid[i].item() + 1)
-        name = cat_to_name.get(idx, "Unknown Flower").title()
-        prob = top3_prob[i].item() * 100
-        st.write(f"- **{name}**: {prob:.1f}%")
-        st.progress(int(prob))
+criterion = nn.CrossEntropyLoss()
+optimizer_stage1 = optim.Adam(model.fc.parameters(), lr=1e-3)
+
+
+def train_one_epoch(model, dataloader, optimizer, criterion):
+  model.train()
+  running_loss, running_corrects = 0.0, 0
+  for inputs, labels in dataloader:
+    inputs, labels = inputs.to(device), labels.to(device)
+    optimizer.zero_grad()
+
+    outputs = model(inputs)
+    loss = criterion(outputs, labels)
+    _, preds = torch.max(outputs, 1)
+
+    loss.backward()
+    optimizer.step()
+
+    running_loss += loss.item() * inputs.size(0)
+    running_corrects += torch.sum(preds == labels.data)
+
+  epoch_loss = running_loss / len(dataloader.dataset)
+  epoch_acc = running_corrects.double() / len(dataloader.dataset)
+  return epoch_loss, epoch_acc
+
+
+print("\n--- STAGE 1: Training Head (5 Epochs) ---")
+for epoch in range(5):
+  loss, acc = train_one_epoch(model, train_loader, optimizer_stage1, criterion)
+  print(f"Epoch {epoch+1}/5 - Loss: {loss:.4f} | Accuracy: {acc*100:.2f}%")
+
+print("\n--- STAGE 2: Fine-Tuning Layer 4 (8 Epochs) ---")
+for param in model.layer4.parameters():
+  param.requires_grad = True
+
+optimizer_stage2 = optim.AdamW(
+    [
+        {"params": model.layer4.parameters(), "lr": 1e-5},
+        {"params": model.fc.parameters(), "lr": 1e-4},
+    ],
+    weight_decay=1e-2,
+)
+
+for epoch in range(8):
+  loss, acc = train_one_epoch(model, train_loader, optimizer_stage2, criterion)
+  print(
+      f"Fine-Tune Epoch {epoch+1}/8 - Loss: {loss:.4f} | Accuracy:"
+      f" {acc*100:.2f}%"
+  )
+
+torch.save(model.state_dict(), "flower_resnet50.pth")
+print("\n🎉 Saved updated weights to 'flower_resnet50.pth'!")
